@@ -341,6 +341,75 @@ def _is_market_open_now(market: str = "KR") -> bool:
     return kis.is_market_open_now(market=market.upper())
 
 
+def _market_open_context(market: str = "KR") -> tuple[ZoneInfo, datetime.time, str, str]:
+    """시장별 정규장 시작 시각과 표시용 타임존 라벨."""
+    market = market.upper()
+    if market == "US":
+        return NY_TZ, datetime.time(9, 30), "09:30", "ET"
+    return KST, datetime.time(9, 0), "09:00", "KST"
+
+
+def _is_before_market_open(market: str = "KR") -> bool:
+    """시장 개장 전인지 확인."""
+    tz, open_time, _, _ = _market_open_context(market)
+    now = datetime.datetime.now(tz)
+    return now.time() < open_time
+
+
+async def _wait_for_market_open(
+    channel: discord.abc.Messageable,
+    market: str = "KR",
+) -> bool:
+    """개장 전이면 개장까지 대기하고, 장 마감 후면 False를 반환."""
+    market = market.upper()
+    if _is_market_open_now(market):
+        return True
+    if not _is_before_market_open(market):
+        return False
+
+    _, _, open_label, _ = _market_open_context(market)
+    market_label = "미국 장" if market == "US" else "장"
+    await channel.send(f"⏳ {market_label}이 아직 열리지 않았습니다. {open_label} 개장까지 대기 중…")
+    _log("INFO", f"{market}_AUTO_BUY_WAIT_MARKET", "장 전 분석 완료, 개장 대기")
+    while not _is_market_open_now(market):
+        await asyncio.sleep(10)
+    await channel.send("🔔 **장이 열렸습니다!** 매수 주문을 진행합니다.")
+    _log("INFO", f"{market}_AUTO_BUY_MARKET_OPENED", "개장 확인, 매수 진행")
+    return True
+
+
+def _resolve_scoring_watchlist(
+    configured_watchlist: list[str],
+    cap_rank: list[dict],
+    volume_rank: list[dict],
+    *,
+    market: str,
+) -> list[str]:
+    """워치리스트 미설정 시 공식 랭킹 결과로 후보 풀을 보완한다."""
+    market = market.upper()
+    if configured_watchlist:
+        return configured_watchlist
+
+    prefix = "US_" if market == "US" else ""
+    watchlist_name = f"{market}_WATCHLIST"
+    if cap_rank:
+        watchlist = [item["ticker"] for item in cap_rank]
+        _log("INFO", f"{prefix}SCORING_FALLBACK_CAP", f"{watchlist_name} 미설정 → 시총 TOP{len(watchlist)} 사용")
+        return watchlist
+    if volume_rank:
+        watchlist = [item["ticker"] for item in volume_rank]
+        _log(
+            "INFO",
+            f"{prefix}SCORING_FALLBACK_VOLUME",
+            f"{watchlist_name} 미설정 → 거래량 TOP{len(watchlist)} 사용",
+        )
+        return watchlist
+
+    reason = f"{watchlist_name} 미설정 + 시총/거래량 조회 실패"
+    _log("WARN", f"{prefix}SCORING_NO_CANDIDATES", reason)
+    return []
+
+
 # ─── Helper: 보고서 생성 ──────────────────────────────────────
 def _build_report_text(
     final_state: dict,
@@ -565,14 +634,14 @@ async def _compute_stock_scores(count: int = 10) -> list[dict]:
     except Exception:
         volume_list = []
 
-    watchlist = kis.kr_watchlist
+    watchlist = _resolve_scoring_watchlist(
+        kis.kr_watchlist,
+        cap_list,
+        volume_list,
+        market="KR",
+    )
     if not watchlist:
-        if cap_list:
-            watchlist = [s["ticker"] for s in cap_list]
-            _log("INFO", "SCORING_FALLBACK_CAP", f"KR_WATCHLIST 미설정 → 시총 TOP{len(watchlist)} 사용")
-        else:
-            _log("WARN", "SCORING_NO_CANDIDATES", "KR_WATCHLIST 미설정 + 시총 조회 실패")
-            return []
+        return []
 
     cap_map = {s["ticker"]: s for s in cap_list}
     volume_map = {s["ticker"]: s for s in volume_list}
@@ -750,17 +819,14 @@ async def _compute_us_stock_scores(count: int = 10) -> list[dict]:
         except Exception:
             volume_rank = []
 
-    watchlist = kis.us_watchlist
+    watchlist = _resolve_scoring_watchlist(
+        kis.us_watchlist,
+        cap_rank,
+        volume_rank,
+        market="US",
+    )
     if not watchlist:
-        if cap_rank:
-            watchlist = [item["ticker"] for item in cap_rank]
-            _log("INFO", "US_SCORING_FALLBACK_CAP", f"US_WATCHLIST 미설정 → 시총 TOP{len(watchlist)} 사용")
-        elif volume_rank:
-            watchlist = [item["ticker"] for item in volume_rank]
-            _log("INFO", "US_SCORING_FALLBACK_VOLUME", f"US_WATCHLIST 미설정 → 거래량 TOP{len(watchlist)} 사용")
-        else:
-            _log("WARN", "US_SCORING_NO_CANDIDATES", "US_WATCHLIST 미설정 + 시총/거래량 조회 실패")
-            return []
+        return []
 
     cap_map = {item["ticker"]: item for item in cap_rank}
     volume_map = {item["ticker"]: item for item in volume_rank}
@@ -1933,8 +1999,8 @@ async def scoring_rules_cmd(
                 f"`{kr_wl}`\n"
                 "• 워치리스트 기본: `+30` (대형주/ETF 신뢰)\n"
                 "• 등락률 `0~2%`: `+25` (안정상승), `2~5%`: `+15`\n"
-                "• 시총 랭크 진입: `+10`\n"
-                "• 거래량 랭크 진입: `+5`\n"
+                "• 시총 랭크 진입: `+10` (응답 가능 시)\n"
+                "• 거래량 랭크 진입: `+5` (응답 가능 시)\n"
                 "필터: 등락률 `>8%` 또는 `<-5%` 제외\n"
                 f"AI 분석: 상위 `{DAY_TRADE_PICKS}`개\n"
                 "오후 매도: 워치리스트 종목은 **스윙 보유** (손절/익절만)"
@@ -1954,8 +2020,8 @@ async def scoring_rules_cmd(
                 f"`{us_wl}`\n"
                 "• 워치리스트 기본: `+30` (대형주/ETF 신뢰)\n"
                 "• 등락률 `0~2%`: `+25` (안정상승), `2~5%`: `+15`\n"
-                "• 시총 랭크 진입: `+10` (실전 API 가능 시)\n"
-                "• US 거래량 랭크 진입: `+5` (가능 시)\n"
+                "• 시총 랭크 진입: `+10` (응답 가능 시)\n"
+                "• 거래량 랭크 진입: `+5` (응답 가능 시)\n"
                 "필터: 등락률 `>8%` 또는 `<-5%` 제외\n"
                 f"AI 분석: 상위 `{US_DAY_TRADE_PICKS}`개\n"
                 "오후 매도: 워치리스트 종목은 **스윙 보유** (손절/익절만)\n"
@@ -2265,13 +2331,10 @@ async def morning_auto_buy():
             return
 
         # ── 3) 장 열림 대기 → 통장 전액 균등분배 → 자동 매수 ──
-        if not _is_market_open_now("KR"):
-            await channel.send("⏳ 장이 아직 열리지 않았습니다. 09:00 개장까지 대기 중…")
-            _log("INFO", "AUTO_BUY_WAIT_MARKET", "장 전 분석 완료, 개장 대기")
-            while not _is_market_open_now("KR"):
-                await asyncio.sleep(10)
-            await channel.send("🔔 **장이 열렸습니다!** 매수 주문을 진행합니다.")
-            _log("INFO", "AUTO_BUY_MARKET_OPENED", "개장 확인, 매수 진행")
+        if not await _wait_for_market_open(channel, "KR"):
+            _log("INFO", "AUTO_BUY_SKIP", "장 마감 이후라 자동매수 생략")
+            await channel.send("❌ 장 마감 이후라 자동매수를 건너뜁니다.")
+            return
 
         try:
             balance_data = await loop.run_in_executor(None, kis.get_balance, "KR")
@@ -2613,9 +2676,6 @@ async def us_morning_auto_buy():
     if not _is_market_day("US"):
         _log("INFO", "US_AUTO_BUY_SKIP", "오늘은 미국시장 휴장일")
         return
-    if not _is_market_open_now("US"):
-        _log("INFO", "US_AUTO_BUY_SKIP", "미국 장시간 아님")
-        return
     if _analysis_lock.locked():
         _log("INFO", "US_AUTO_BUY_SKIP", "analysis lock 사용 중")
         return
@@ -2739,6 +2799,11 @@ async def us_morning_auto_buy():
 
         if not buy_targets:
             await channel.send("📋 **미국 AI 분석 완료** — BUY 종목이 없어 매수를 건너뜁니다.")
+            return
+
+        if not await _wait_for_market_open(channel, "US"):
+            _log("INFO", "US_AUTO_BUY_SKIP", "미국 장 마감 이후라 자동매수 생략")
+            await channel.send("❌ 미국 장 마감 이후라 자동매수를 건너뜁니다.")
             return
 
         try:

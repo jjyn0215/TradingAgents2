@@ -4,257 +4,230 @@
 
 ---
 
-# TradingAgents: 멀티 에이전트 LLM 데이 트레이딩 시스템
+# TradingAgents: Discord 기반 멀티 에이전트 자동매매 봇
 
-> TradingAgents 기반 Discord 봇으로, **실시간 스코어링(09:30) → 상위 AI 분석 → 자동 매수 → 장 마감 전 자동 매도(15:20)**를 수행하는 완전 자동 데이 트레이딩 시스템입니다.
+> TradingAgents 프레임워크에 Discord 봇, 한국투자증권 Open API, KR/US 워치리스트 전략을 결합한 자동매매 프로젝트입니다.
 
 ---
 
 ## 목차
 
-- [시스템 개요](#시스템-개요)
-- [아키텍처](#아키텍처)
-  - [에이전트 팀 구조](#에이전트-팀-구조)
-  - [Discord 봇 흐름](#discord-봇-흐름)
-  - [한국투자증권 API 연동](#한국투자증권-api-연동)
+- [한눈에 보기](#한눈에-보기)
+- [전략 개요](#전략-개요)
+- [에이전트 아키텍처](#에이전트-아키텍처)
 - [설치](#설치)
-- [환경 설정 (.env)](#환경-설정-env)
+- [환경 설정](#환경-설정)
 - [사용법](#사용법)
-  - [Discord 봇 명령어](#discord-봇-명령어)
-  - [자동 스케줄](#자동-스케줄)
-  - [Python 직접 사용](#python-직접-사용)
-  - [CLI 사용](#cli-사용)
-- [지원 LLM 모델](#지원-llm-모델)
-- [파일 구조](#파일-구조)
-- [안전장치](#안전장치)
+- [KIS API 연동](#kis-api-연동)
+- [LLM과 데이터 소스](#llm과-데이터-소스)
+- [프로젝트 구조](#프로젝트-구조)
+- [운영 메모](#운영-메모)
 - [Citation](#citation)
 
 ---
 
-## 시스템 개요
+## 한눈에 보기
 
-이 시스템은 **5개의 전문 AI 에이전트 팀**이 협업하여 주식을 분석하고, Discord를 통해 사용자와 상호작용하며, 한국투자증권 API로 실제 매매까지 연결하는 엔드투엔드 자동 투자 플랫폼입니다.
-
-### 전체 흐름 (데이 트레이딩)
-
-```
-🌅 매일 아침 (09:30 KST) ─ 스코어링 + AI 분석 + 자동 매수
-┌─────────────────────────────────────────────────┐
-│  1. 실시간 KIS 순위 API 4종 멀티시그널 스코어링  │
-│     ├─ 거래량 순위 (+10점)                        │
-│     ├─ 체결강도 순위 (≥120: +25점)                │
-│     ├─ 등락률 순위 (0~3%: +20점)                  │
-│     └─ 대량체결 매수 순위 (+15점)                  │
-│  2. 상위 5개만 순차 AI 분석 (~25분, BUY만 수집)     │
-│     ├─ 애널리스트 4명 (시장/소셜/뉴스/펀더멘털)    │
-│     ├─ 리서치팀 토론 (강세 vs 약세)                │
-│     ├─ 트레이더 투자계획 수립                      │
-│     ├─ 리스크 관리팀 (공격/보수/중립)              │
-│     └─ 포트폴리오 매니저 최종 결정                 │
-│  3. BUY 종목 통장 전액 ÷ 종목수 균등분배 → 자동 매수 │
-└─────────────────────────────────────────────────┘
-        ↓  (장중 30분 간격 손절/익절 감시)
-📅 매일 오후 (15:20 KST) ─ 자동 매도
-┌─────────────────────────────────────────────────┐
-│  4. 보유 전종목 전량 시장가 매도                   │
-│  5. 실패 시 60초 후 1회 자동 재시도                │
-│  6. 일일 손익 요약 + 누적 승률 Discord 보고        │
-└─────────────────────────────────────────────────┘
-```
-
-> **핵심**: 스코어링(무료, ~5초)으로 먼저 걸러내고, AI(유료, ~5분/종목)는 상위 5개만 분석.
-> 일일 토큰 비용 ~$2.5 (월 ~$50)
+- Discord 슬래시 명령 11개로 분석, 잔고조회, 수동 주문, 스코어링, 손익 조회를 제공합니다.
+- 한국(KR)과 미국(US) 모두 워치리스트 기반 스코어링 뒤 상위 후보만 AI 분석합니다.
+- 자동매매는 `룰 기반 후보 선정 -> 상위 N개 AI 분석 -> BUY 종목만 균등매수 -> 오후 점검 -> 손절/익절 감시` 흐름으로 동작합니다.
+- 분석 보고서는 Markdown 파일로 저장되며, 필요하면 Discord에도 자동 업로드합니다.
+- 매매 이력과 실현손익은 SQLite로 누적 관리합니다.
 
 ---
 
-## 아키텍처
+## 전략 개요
 
-### 에이전트 팀 구조
+### 전체 흐름
 
-시스템은 실제 트레이딩 회사의 조직 구조를 모방합니다:
-
-#### 1단계: 애널리스트팀 (4명이 동시에 분석)
-
-| 에이전트 | 역할 | 데이터 소스 |
-|----------|------|-------------|
-| 📊 **시장 애널리스트** | 기술적 지표 분석 (MACD, RSI, 볼린저 밴드, 이동평균선) | yfinance |
-| 💬 **소셜 미디어 애널리스트** | SNS 감성 분석, 투자자 심리 평가 | yfinance 뉴스 |
-| 📰 **뉴스 애널리스트** | 글로벌 뉴스, 내부자 거래, 거시경제 이벤트 분석 | yfinance 뉴스 |
-| 📈 **펀더멘털 애널리스트** | 재무제표, 대차대조표, 현금흐름표, 손익계산서 분석 | yfinance |
-
-#### 2단계: 리서치팀 (토론)
-
-| 에이전트 | 역할 |
-|----------|------|
-| 🟢 **강세 리서처** | 매수 근거를 제시하고 옹호 |
-| 🔴 **약세 리서처** | 리스크와 매도 근거를 제시 |
-| ⚖️ **리서치 매니저** | 양측 토론을 심판하고 최종 리서치 결론 도출 |
-
-- `max_debate_rounds` 설정에 따라 여러 라운드의 토론 진행
-
-#### 3단계: 트레이딩팀
-
-| 에이전트 | 역할 |
-|----------|------|
-| 🏦 **트레이더** | 애널리스트+리서치 결과를 종합하여 구체적 투자 계획 수립 |
-
-#### 4단계: 리스크 관리팀 (3자 토론)
-
-| 에이전트 | 역할 |
-|----------|------|
-| 🔥 **공격적 리스크 매니저** | 높은 수익을 위한 공격적 관점 |
-| 🛡️ **보수적 리스크 매니저** | 자본 보전 중심의 보수적 관점 |
-| ⚖️ **중립적 리스크 매니저** | 균형 잡힌 리스크-수익 분석 |
-
-#### 5단계: 최종 결정
-
-| 에이전트 | 역할 |
-|----------|------|
-| 💼 **포트폴리오 매니저** | 모든 보고서를 검토하고 **BUY / SELL / HOLD** 최종 결정 |
-
-### Discord 봇 흐름
-
-```
-Discord 명령어 입력
-    ↓
-[채널 권한 확인] → 미허용 채널이면 차단
-    ↓
-[분석 잠금 확인] → 이미 분석 중이면 대기 메시지
-    ↓
-[분석 실행] → run_in_executor (비동기 래핑)
-    ↓
-[결과 Embed 전송]
-  ├─ 🟢 BUY → 초록색 Embed + 매수 확인 버튼
-  ├─ 🔴 SELL → 빨간색 Embed
-  └─ 🟡 HOLD → 주황색 Embed
-    ↓
-[전체 보고서 .md 파일 첨부]
-    ↓
-[매수 버튼 클릭 시] → KIS API 시장가 매수 → 체결 결과 전송
+```text
+워치리스트/랭킹 후보 수집
+-> 룰 기반 점수 계산
+-> 상위 후보만 TradingAgentsGraph AI 분석
+-> BUY 종목만 균등분할 매수
+-> 오후 매도 점검
+-> 손절/익절 모니터링
 ```
 
-### 한국투자증권 API 연동
+### 시장별 자동매매 흐름
 
-`kis_client.py`가 한국투자증권 REST API를 래핑합니다:
+| 시장 | 후보 풀 | 자동 매수 | 오후 점검 | 장중 감시 |
+|------|---------|-----------|-----------|-----------|
+| KR | `KR_WATCHLIST` 우선, 비어 있으면 시총/거래량 랭킹 fallback | `AUTO_BUY_TIME` (기본 `09:30` KST) | `AUTO_SELL_TIME` (기본 `15:20` KST) | `MONITOR_INTERVAL_MIN` 간격 |
+| US | `US_WATCHLIST` 우선, 비어 있으면 시총/거래량 랭킹 fallback | `US_AUTO_BUY_TIME` (기본 `09:35` ET) | `US_AUTO_SELL_TIME` (기본 `15:50` ET) | `MONITOR_INTERVAL_MIN` 간격 |
 
-| 기능 | API | 설명 |
-|------|-----|------|
-| **토큰 발급** | `POST /oauth2/tokenP` | OAuth2 access token 자동 발급/갱신 |
-| **잔고 조회** | `GET /trading/inquire-balance` | 보유종목, 평가손익, 예수금 조회 |
-| **현재가 조회** | `GET /quotations/inquire-price` | 종목 실시간 현재가 |
-| **매수** | `POST /trading/order-cash` | 시장가/지정가 매수 주문 |
-| **매도** | `POST /trading/order-cash` | 시장가/지정가 매도 주문 |
-| **시가총액 순위** | `GET /ranking/market-cap` | 코스피 시가총액 상위 종목 조회 |
-| **거래량 순위** | `GET /quotations/volume-rank` | 거래량 상위 종목 (스코어링) |
-| **체결강도 순위** | `GET /ranking/volume-power` | 매수/매도 체결강도 비율 |
-| **등락률 순위** | `GET /ranking/fluctuation` | 등락률 상위 종목 |
-| **대량체결 순위** | `GET /ranking/bulk-trans-num` | 기관/외국인 대량 매수 |
-| **전량 매도** | `sell_all_holdings()` | 보유 전종목 일괄 시장가 매도 |
+### 현재 스코어링 규칙
 
-- **멀티시그널 스코어링**: 5개 순위 API를 종합하여 종목별 점수 산정
-- **모의투자/실전 전환**: `KIS_VIRTUAL=true/false`로 제어
-- 모의투자와 실전은 URL이 다름 (자동 처리)
+KR/US 공통 골격은 같습니다.
+
+- 워치리스트 기본 점수: `+30`
+- 등락률 `0~2%`: `+25`
+- 등락률 `2~5%`: `+15`
+- 시가총액 랭크 진입: `+10`
+- 거래량 랭크 진입: `+5`
+- 필터: 등락률 `> 8%` 또는 `< -5%`면 제외
+
+추가 메모:
+
+- KR은 KIS 현재가와 yfinance 전일 종가를 함께 써서 점수를 계산합니다.
+- US는 yfinance 가격 이력을 기본으로 쓰고, KIS 미국 현재가가 가능하면 현재가를 보정합니다.
+- 랭킹 보너스는 응답이 있을 때만 붙습니다.
+- 현재 코드 기준으로 미국 시총/거래량 랭킹은 모의투자에서 비활성 처리되어, 실전 환경에서만 반영됩니다.
+
+### 오후 매도 정책
+
+- 워치리스트에 포함된 종목은 강제 청산하지 않고 스윙 보유합니다.
+- 워치리스트 밖 보유 종목만 오후 점검 시 시장가 매도합니다.
+- 손절/익절 조건은 워치리스트 여부와 관계없이 계속 감시합니다.
+
+### 손절/익절 규칙
+
+- 손절: `STOP_LOSS_PCT` 이하
+- 익절: `TAKE_PROFIT_PCT` 이상
+- 감시 주기: `MONITOR_INTERVAL_MIN` 분
+
+---
+
+## 에이전트 아키텍처
+
+TradingAgentsGraph는 아래 구조로 동작합니다.
+
+### 1. 애널리스트 팀
+
+- 시장 애널리스트: 기술적 지표와 차트 흐름 분석
+- 소셜 미디어 애널리스트: 투자 심리와 센티먼트 분석
+- 뉴스 애널리스트: 뉴스와 이벤트 리스크 분석
+- 펀더멘털 애널리스트: 재무와 사업 체력 분석
+
+### 2. 리서치 팀
+
+- 강세 리서처
+- 약세 리서처
+- 리서치 매니저
+
+### 3. 트레이딩/리스크 팀
+
+- 트레이더
+- 공격적 리스크 매니저
+- 보수적 리스크 매니저
+- 중립적 리스크 매니저
+
+### 4. 최종 의사결정
+
+- 포트폴리오 매니저가 `BUY / SELL / HOLD`를 확정합니다.
 
 ---
 
 ## 설치
 
-### 1. 레포 클론
+### 1. 레포지토리 클론
+
 ```bash
 git clone https://github.com/TauricResearch/TradingAgents.git
 cd TradingAgents
 ```
 
-### 2. 가상환경 생성 & 활성화
+### 2. 가상환경
+
 ```bash
 python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# macOS/Linux
 source .venv/bin/activate
 ```
 
-### 3. 의존성 설치
+Windows는 아래를 사용하세요.
+
 ```bash
-pip install -r requirements.txt
+.venv\Scripts\activate
 ```
 
-### 4. 환경변수 설정
+### 3. 의존성 설치
+
+Discord 봇을 바로 실행하려면 아래 조합이 가장 안전합니다.
+
+```bash
+pip install -r requirements.txt python-dotenv
+pip install -e .
+```
+
+### 4. 환경변수 파일 준비
+
 ```bash
 cp .env.example .env
-# .env 파일을 열어서 API 키 입력
 ```
 
 ---
 
-## 환경 설정 (.env)
+## 환경 설정
+
+기본 템플릿은 [`.env.example`](/home/devuser/projects/TradingAgents2/.env.example)에 있습니다.
 
 ```env
-# ─── LLM 제공자 (사용하는 것만 설정) ───────────────────
-OPENAI_API_KEY=sk-...
-GOOGLE_API_KEY=AIza...
-ANTHROPIC_API_KEY=sk-ant-...
-XAI_API_KEY=xai-...
-OPENROUTER_API_KEY=sk-or-...
+# LLM Providers
+OPENAI_API_KEY=
+GOOGLE_API_KEY=
+ANTHROPIC_API_KEY=
+XAI_API_KEY=
+OPENROUTER_API_KEY=
 
-# ─── Discord 봇 ────────────────────────────────────────
-DISCORD_BOT_TOKEN=MTIz...           # 필수
-DISCORD_CHANNEL_IDS=123456,789012   # 봇 동작 채널 (비우면 전체)
+# Discord
+DISCORD_BOT_TOKEN=
+# DISCORD_CHANNEL_IDS=123456789012345678,987654321098765432
 
-# ─── LLM 모델 설정 (선택) ──────────────────────────────
-DEEP_THINK_LLM=gemini-3-flash-preview   # 깊은 추론용
-QUICK_THINK_LLM=gemini-3-flash-preview  # 빠른 작업용
-MAX_DEBATE_ROUNDS=1                      # 리서치 토론 라운드
+# KIS
+KIS_APP_KEY=
+KIS_APP_SECRET=
+KIS_ACCOUNT_NO=12345678-01
+KIS_VIRTUAL=true
+KIS_MAX_ORDER_AMOUNT=1000000
+KR_WATCHLIST=005930,000660,005380,005490,035420,105560,069500,114800,226490,229200
 
-# ─── 한국투자증권 API ──────────────────────────────────
-KIS_APP_KEY=PSxxx...                # 앱키 (36자리)
-KIS_APP_SECRET=xxx...               # 시크릿키 (180자리)
-KIS_ACCOUNT_NO=12345678-01          # 계좌번호
-KIS_VIRTUAL=true                    # true=모의투자, false=실전
-KIS_MAX_ORDER_AMOUNT=1000000        # 수동(/분석,/대형주,/매수) 1회 매수 예산 상한
-
-# ─── 미국(US) 거래 설정 ───────────────────────────────
-ENABLE_US_TRADING=false             # 미국 자동주문 활성화
-US_MAX_ORDER_AMOUNT=5000            # 수동(/분석,/매수) 미국 매수 예산 상한 (USD)
+# US
+ENABLE_US_TRADING=false
+US_MAX_ORDER_AMOUNT=5000
 US_EXCHANGE_SEARCH_ORDER=NASD,NYSE,AMEX
-US_WATCHLIST=AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,AMD,AVGO,QQQ,SPY  # 미국 대형주/ETF 워치리스트
+US_WATCHLIST=AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,AMD,AVGO,QQQ,SPY
 
-# ─── 데이 트레이딩 설정 ──────────────────────────────
-DAY_TRADE_PICKS=5                   # 매일 매수할 종목 수 (기본 5)
-AUTO_BUY_TIME=09:30                 # 자동 매수 시각 KST (기본 09:30)
-AUTO_SELL_TIME=15:20                # 자동 매도 시각 KST (기본 15:20)
-REPORTS_DIR=reports                 # 분석 보고서 저장 경로 (도커: /app/reports)
-AUTO_REPORT_UPLOAD=true             # 자동매매 분석 보고서 디스코드 업로드 여부
+# Schedule
+DAY_TRADE_PICKS=5
+AUTO_BUY_TIME=09:30
+AUTO_SELL_TIME=15:20
+US_DAY_TRADE_PICKS=5
+US_AUTO_BUY_TIME=09:35
+US_AUTO_SELL_TIME=15:50
 
-# ─── 미국 데이 트레이딩 설정 (뉴욕시간 ET) ─────────────
-US_DAY_TRADE_PICKS=5                # 미국 자동매수 종목 수
-US_AUTO_BUY_TIME=09:35              # 미국 자동 매수 시각 ET
-US_AUTO_SELL_TIME=15:50             # 미국 자동 매도 시각 ET
-# KIS_US_MARKET_CAP_PATH=/uapi/overseas-stock/v1/ranking/market-cap   # 실전 전용
-# KIS_US_MARKET_CAP_TR_ID=HHDFS76350100
-# KIS_US_MARKET_CAP_VOL_RANG=0
+# Risk / reports
+STOP_LOSS_PCT=-5.0
+TAKE_PROFIT_PCT=10.0
+MONITOR_INTERVAL_MIN=30
+REPORTS_DIR=reports
+AUTO_REPORT_UPLOAD=true
 
-# ─── 손절/익절 설정 ──────────────────────────────
-STOP_LOSS_PCT=-5.0                  # 손절 라인 (%, 기본 -5%)
-TAKE_PROFIT_PCT=10.0                # 익절 라인 (%, 기본 10%)
-MONITOR_INTERVAL_MIN=30             # 모니터링 간격 (분, 기본 30분)
+# Optional bot model overrides
+DEEP_THINK_LLM=gemini-3-flash-preview
+QUICK_THINK_LLM=gemini-3-flash-preview
+MAX_DEBATE_ROUNDS=1
 ```
 
-### 한국투자증권 API 키 발급 방법
-1. [한국투자증권 홈페이지](https://www.koreainvestment.com/)에 로그인
-2. **API 포탈** → **API 신청** → 앱키 발급
-3. 모의투자용과 실전용 앱키가 **별도**이므로, 테스트 시 모의투자 앱키를 먼저 발급
+### 설정 메모
 
-### Discord 봇 토큰 발급 방법
-1. [Discord Developer Portal](https://discord.com/developers/applications) → New Application
-2. **Bot** 탭 → Token 복사
-3. **OAuth2** → URL Generator → `bot` + `applications.commands` 스코프 선택
-4. 권한: Send Messages, Embed Links, Attach Files, Use Slash Commands
-5. 생성된 초대 URL로 서버에 봇 초대
+- `DISCORD_CHANNEL_IDS`를 비워두면 수동 명령은 모든 채널에서 사용할 수 있습니다.
+- 자동매매 스케줄은 `DISCORD_CHANNEL_IDS`가 설정된 경우에만 실제로 동작합니다.
+- 미국 수동/자동 주문은 `ENABLE_US_TRADING=true`가 아니면 막힙니다.
+- `KIS_VIRTUAL=true`면 모의투자, `false`면 실전투자입니다.
+- Discord 봇은 모델명만 환경변수로 덮어쓰고, 기본 provider는 [`tradingagents/default_config.py`](/home/devuser/projects/TradingAgents2/tradingagents/default_config.py) 설정을 따릅니다.
 
-### Discord 채널 ID 확인 방법
-1. Discord 설정 → 고급 → **개발자 모드** ON
-2. 채널 우클릭 → **채널 ID 복사**
+### KIS 앱키 발급
+
+1. [한국투자증권 API 포털](https://apiportal.koreainvestment.com)에 로그인합니다.
+2. 앱키를 발급합니다.
+3. 모의투자와 실전투자는 앱키가 다릅니다.
+4. 계좌번호는 `12345678-01` 형식으로 입력합니다.
+
+### Discord 봇 토큰 발급
+
+1. [Discord Developer Portal](https://discord.com/developers/applications)에서 애플리케이션을 만듭니다.
+2. `Bot` 탭에서 토큰을 발급합니다.
+3. OAuth2에서 `bot`, `applications.commands` 스코프를 추가해 서버에 초대합니다.
 
 ---
 
@@ -266,137 +239,87 @@ MONITOR_INTERVAL_MIN=30             # 모니터링 간격 (분, 기본 30분)
 python bot.py
 ```
 
-성공 시 콘솔 출력:
-```
-✅ TradingBot#1234 로그인 완료!
-   서버 수: 1
-  동기화된 슬래시 명령 수: 10
-  슬래시 명령: /분석, /대형주, /잔고, /매수, /매도, /상태, /봇정보, /스코어링, /스코어규칙, /수익, /수익초기화
-   KIS: ✅ 설정됨
-   모드: 🧪 모의투자
-   데이 트레이딩: 매수 09:30 / 매도 15:20 KST
-   매수 종목 수: 5개 | 예산: 통장 전액
-   손절: -5.0% | 익절: 10.0%
-   모니터링: 30분 간격
-   허용 채널: {123456789012345678}
-```
+정상 실행 시 봇은 아래 정보를 콘솔에 출력합니다.
 
-### Discord 봇 명령어
+- 동기화된 슬래시 명령 수
+- KR/US 자동매매 시각
+- 손절/익절 기준
+- 허용 채널 여부
+- 모의/실전 모드
 
-#### 분석 명령
+### 슬래시 명령어
 
-| 명령 | 설명 | 예시 |
-|------|------|------|
-| `/분석 <티커>` | 단일 종목 AI 분석 | `/분석 AAPL` |
-| `/분석 <티커> <날짜>` | 특정 날짜 기준 분석 | `/분석 005930 2026-02-13` |
-
-- 분석 완료 시 **색상 코딩된 Embed** (BUY=🟢, SELL=🔴, HOLD=🟡) 표시
-- **전체 보고서**는 `.md` 파일로 첨부
-- 보고서는 디스크에도 저장됨 (`REPORTS_DIR`, 기본 `reports/`)
-- 티커는 **시장 자동판단**: `005930`(KR), `AAPL`(US)
-- **BUY** → 매수 확인 버튼 표시 (KIS 설정 시)
-- **SELL + 해당 종목 보유 중** → 매도 확인 버튼 표시
-- **HOLD / SELL(미보유)** → Embed만 표시
-
-#### 대형주 TOP5 분석
+현재 등록되는 명령은 11개입니다.
 
 | 명령 | 설명 |
 |------|------|
-| `/대형주` | 코스피 시가총액 TOP5 조회 → 전체 AI 분석 |
-| `/대형주 <날짜>` | 특정 날짜 지정 |
-
-**실행 과정:**
-1. KIS 공식 API로 코스피 시가총액 상위 5개 종목 조회
-2. TOP5 목록을 Embed로 표시 (종목명, 코드, 현재가, 시가총액)
-3. 각 종목을 **순차적으로** AI 분석 (진행률 표시: `[1/5]`, `[2/5]`...)
-4. 분석 완료 후 BUY 판정 종목에 **매수 확인 버튼** 노출 (정규장/거래일에만)
-5. SELL 판정 + 보유 종목에 **매도 확인 버튼** 노출
-6. `✅ 매수 확인` / `🔴 매도 확인` 클릭 → KIS API 시장가 주문 실행
-7. `⏭️ 건너뛰기` / `취소` 클릭 → 해당 종목 스킵
-
-**예산 분배 규칙:**
-- `/대형주` 수동 실행: `KIS_MAX_ORDER_AMOUNT` 상한을 BUY 종목 수로 균등 분할 (테스트 모드)
-- 자동매수(09:30): 예수금 전액을 BUY 종목 수로 균등 분할 (실전 데이 트레이딩)
-
-**장외/휴장 정책:**
-- 장이 닫힌 시간(또는 휴장일)에는 `/대형주`의 BUY 버튼을 비활성화하고 추천 종목만 안내합니다.
-
-#### 계좌 관리
-
-| 명령 | 설명 |
-|------|------|
-| `/잔고` | 보유종목, 평가손익, 예수금 조회 |
-| `/매수 <종목코드> [수량]` | 시장가 매수 (수량 생략 시 예산 상한 기준 자동 계산, 확인 버튼) |
-| `/매도 <종목코드>` | 전량 시장가 매도 (확인 버튼) |
-| `/매도 <종목코드> <수량>` | 지정 수량 매도 (확인 버튼) |
-| `/스코어링 [시장] [count] [exclude_held]` | 실시간 스코어링 후보 조회 |
-| `/스코어규칙 [시장]` | KR/US 스코어링 가중치/필터 규칙 조회 |
-| `/수익` | 누적 실현손익(통화분리), 승률, 종목별 수익 조회 |
-| `/수익초기화 [통화]` | `/수익` 집계 기준을 현재 시점으로 초기화 |
+| `/분석 <티커> [날짜]` | 단일 종목 멀티 에이전트 AI 분석, 보고서 파일 첨부 |
+| `/대형주 [날짜]` | KR 스코어링 TOP5를 순차 분석하고 BUY 종목에 버튼 제공 |
+| `/잔고` | KRW/USD 계좌 요약과 보유 종목 조회 |
+| `/매수 <티커> [수량]` | 시장별 수동 예산 상한 기준 매수 확인 버튼 표시 |
+| `/매도 <티커> [수량]` | 보유 수량 기준 매도 확인 버튼 표시 |
 | `/상태` | 오늘 자동매매 실행 상태 조회 |
-| `/봇정보` | 스케줄/설정/계좌/실행이력 통합 조회 |
+| `/봇정보` | 스케줄, 설정, 계좌 요약, 오늘 이력을 한 번에 조회 |
+| `/스코어링 [시장] [count] [exclude_held]` | 실시간 후보 점수 조회 |
+| `/스코어규칙 [시장]` | 현재 코드 기준 스코어링 규칙 조회 |
+| `/수익` | 누적 실현손익, 승률, 종목별 요약 조회 |
+| `/수익초기화 [통화]` | 손익 집계 기준 시점 초기화 |
 
-- 잔고 조회 시 각 종목의 **시장(KR/US)**, **평균매수가 → 현재가**, **손익금액**, **수익률** 표시
-- `/수익`은 KRW/USD를 분리 집계하여 환산 왜곡을 방지
-- `/수익초기화`는 기존 손익 로그를 삭제하지 않고, **이후 실현손익만 다시 누적 집계**하도록 기준 시점을 기록
-- 매도 시 **확인/취소 버튼**이 나타나며, 확인 클릭 시에만 실행
+### 수동 주문 동작 방식
 
-### 자동 스케줄 (데이 트레이딩)
+- `/매수`는 수량을 생략하면 `KIS_MAX_ORDER_AMOUNT` 또는 `US_MAX_ORDER_AMOUNT` 기준으로 자동 수량을 계산합니다.
+- `/매도`는 수량을 생략하면 전량 매도로 동작합니다.
+- 장이 닫혀 있으면 매수 버튼을 띄우지 않습니다.
+- 매수 확인 버튼은 5분, 매도 확인 버튼은 2분 뒤 만료됩니다.
 
-`DISCORD_CHANNEL_IDS`가 설정되어 있으면, 매일 자동으로 **매수 → 감시 → 매도** 사이클을 실행합니다.
+### 자동매매 스케줄
 
-#### 아침 자동매수 (기본 09:30 KST)
+자동매매는 허용 채널이 있을 때만 실행됩니다.
 
-**실행 순서:**
-1. **실시간 멀티시그널 스코어링** — KIS 순위 API 4종(거래량·체결강도·등락률·대량체결) 조회 (~5초)
-2. **상위 5개 후보 순차 AI 분석** — BUY 판정 종목만 수집 (~25분)
-3. **자동 매수** — 통장 전액 ÷ BUY 종목 수 균등분배 → 시장가 매수
+#### KR 자동매수
 
-> 스코어링(무료)으로 먼저 걸러내고, AI(유료)는 상위 5개만 분석 → 일일 토큰 비용 ~$2.5
+1. 워치리스트 점수 계산
+2. 보유 종목 제외
+3. 상위 `DAY_TRADE_PICKS`만 AI 분석
+4. BUY 종목만 통장 전액 균등분할 매수
+5. 장 시작 전 분석이 끝나면 개장까지 대기 후 주문
 
-#### 장중 손절/익절 모니터링 (30분 간격)
+#### KR 오후 점검
 
-| 조건 | 동작 |
-|------|------|
-| 수익률 ≤ `-5%` (손절 라인) | 🚨 자동 시장가 매도 + Discord 알림 |
-| 수익률 ≥ `+10%` (익절 라인) | 🎉 자동 시장가 매도 + Discord 알림 |
+1. 보유 종목 조회
+2. `KR_WATCHLIST` 밖 종목만 시장가 매도
+3. 워치리스트 종목은 유지
+4. 결과를 Discord와 손익 DB에 반영
 
-- 임계값은 `.env`의 `STOP_LOSS_PCT`, `TAKE_PROFIT_PCT`로 설정
-- **확인 없이 자동 매도** → 손실 확대/이익 환수 방지
+#### US 자동매매
 
-#### 오후 매도 점검 (기본 15:20 KST)
+- `ENABLE_US_TRADING=true`일 때만 실행됩니다.
+- KR과 동일한 흐름으로 동작하되 시간대만 ET 기준입니다.
+- 오후 점검도 `US_WATCHLIST` 밖 종목만 정리합니다.
 
-1. 워치리스트 외 보유 종목만 전량 시장가 매도
-2. 워치리스트 종목은 스윙 보유 유지, 손절/익절만 적용
-3. 실패 종목 60초 후 1회 자동 재시도
-4. 종목별 손익 + 일일 합산 + 누적 승률 Discord 보고
+#### 손절/익절 모니터링
 
-#### 미국 자동 스케줄 (ENABLE_US_TRADING=true)
+- KR/US 보유 종목 전체를 감시합니다.
+- 손절 또는 익절 조건에 도달하면 확인 없이 자동 매도합니다.
 
-1. **미국 자동매수**: `US_WATCHLIST` 기반 스코어링 → 상위 AI 분석 → `US_AUTO_BUY_TIME` (기본 09:35 ET) 매수
-2. **미국 오후 매도 점검**: `US_AUTO_SELL_TIME` (기본 15:50 ET)에 워치리스트 외 종목만 정리
-3. 미국 시총 랭킹 API(실전 전용)가 가능하면 KR처럼 시총 보너스를 함께 반영
-4. 상태키 분리: `us_morning_buy`, `us_afternoon_sell`
+### 분석 보고서
 
-### Python 직접 사용
+- 보고서는 `REPORTS_DIR` 아래 Markdown 파일로 저장됩니다.
+- `AUTO_REPORT_UPLOAD=true`면 자동매매 중 생성된 보고서도 Discord로 업로드합니다.
+
+### Python에서 직접 사용
 
 ```python
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.default_config import DEFAULT_CONFIG
 
 config = DEFAULT_CONFIG.copy()
-config["llm_provider"] = "google"
 config["deep_think_llm"] = "gemini-3-flash-preview"
 config["quick_think_llm"] = "gemini-3-flash-preview"
 
 ta = TradingAgentsGraph(debug=True, config=config)
-
-# 분석 실행 → (전체상태, BUY/SELL/HOLD) 반환
-final_state, decision = ta.propagate("005930", "2026-02-13")
-print(decision)  # "BUY", "SELL", or "HOLD"
-
-# (선택) 실제 결과로 에이전트 학습
-# ta.reflect_and_remember(1000)  # 수익률 입력
+final_state, decision = ta.propagate("AAPL", "2026-03-18")
+print(decision)
 ```
 
 ### CLI 사용
@@ -405,93 +328,124 @@ print(decision)  # "BUY", "SELL", or "HOLD"
 python -m cli.main
 ```
 
-터미널에서 대화형으로 종목, 날짜, LLM 모델 등을 선택하고 분석을 실행합니다.
+또는 설치 후:
 
----
-
-## 지원 LLM 모델
-
-| 제공자 | 모델 |
-|--------|------|
-| **OpenAI** | `gpt-5.2`, `gpt-5.1`, `gpt-5`, `gpt-5-mini`, `gpt-5-nano`, `gpt-4.1`, `gpt-4.1-mini`, `gpt-4.1-nano`, `o4-mini`, `o3`, `o3-mini`, `o1`, `gpt-4o`, `gpt-4o-mini` |
-| **Google Gemini** | `gemini-3-pro-preview`, `gemini-3-flash-preview`, `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-2.0-flash`, `gemini-2.0-flash-lite` |
-| **Anthropic Claude** | `claude-opus-4-5`, `claude-sonnet-4-5`, `claude-haiku-4-5`, `claude-opus-4-1-20250805`, `claude-sonnet-4-20250514`, `claude-3-7-sonnet-20250219`, `claude-3-5-sonnet-20241022`, `claude-3-5-haiku-20241022` |
-| **xAI Grok** | `grok-4-1-fast`, `grok-4-1-fast-reasoning`, `grok-4`, `grok-4-0709` |
-| **Ollama** | 모든 로컬 모델 (제한 없음) |
-| **OpenRouter** | 모든 라우팅 모델 (제한 없음) |
-
----
-
-## 파일 구조
-
+```bash
+tradingagents
 ```
+
+---
+
+## KIS API 연동
+
+핵심 구현은 [`kis_client.py`](/home/devuser/projects/TradingAgents2/kis_client.py)에 있습니다.
+
+### 현재 실제로 쓰는 API
+
+| 기능 | 엔드포인트 | 비고 |
+|------|------------|------|
+| OAuth 토큰 | `POST /oauth2/tokenP` | 실전/모의 공통 |
+| KR 잔고 조회 | `GET /uapi/domestic-stock/v1/trading/inquire-balance` | KRW 요약 포함 |
+| US 잔고 조회 | `GET /uapi/overseas-stock/v1/trading/inquire-balance` | 거래소별 합산 |
+| KR 현재가 | `GET /uapi/domestic-stock/v1/quotations/inquire-price` | 국내 6자리 코드 |
+| US 현재가 | `GET /uapi/overseas-price/v1/quotations/price` | 거래소 탐색 포함 |
+| KR 주문 | `POST /uapi/domestic-stock/v1/trading/order-cash` | 시장가 매수/매도 |
+| US 주문 | `POST /uapi/overseas-stock/v1/trading/order` | 시장가 매수/매도 |
+| KR 시총 랭킹 | `GET /uapi/domestic-stock/v1/ranking/market-cap` | 스코어링 보너스 |
+| KR 거래량 랭킹 | `GET /uapi/domestic-stock/v1/quotations/volume-rank` | 스코어링 보너스 |
+| US 시총 랭킹 | `GET /uapi/overseas-stock/v1/ranking/market-cap` | 실전에서만 사용 |
+| US 거래량 랭킹 | `GET /uapi/overseas-stock/v1/ranking/trade-vol` | 실전에서만 사용 |
+
+### 코드에 남아 있는 KR 보조 랭킹 유틸리티
+
+현재 기본 전략은 사용하지 않지만, 아래 API 래퍼도 구현돼 있습니다.
+
+- 체결강도 순위: `get_volume_power()`
+- 등락률 순위: `get_fluctuation_rank()`
+- 대량체결 순위: `get_bulk_trans()`
+
+### 중요한 운영 차이
+
+- KR 워치리스트가 비어 있으면 시총 랭킹, 그다음 거래량 랭킹으로 후보를 보완합니다.
+- US 워치리스트가 비어 있어도 같은 순서로 fallback 합니다.
+- 미국 시총/거래량 랭킹은 현재 코드에서 모의투자 시 빈 결과를 반환하도록 되어 있습니다.
+
+---
+
+## LLM과 데이터 소스
+
+### 프레임워크가 지원하는 LLM 제공자
+
+- OpenAI
+- Google
+- Anthropic
+- xAI
+- OpenRouter
+- Ollama
+
+### 현재 Discord 봇 기본값
+
+- provider 기본값: [`tradingagents/default_config.py`](/home/devuser/projects/TradingAgents2/tradingagents/default_config.py)
+- 봇 환경변수로 덮는 값: `DEEP_THINK_LLM`, `QUICK_THINK_LLM`, `MAX_DEBATE_ROUNDS`
+- 데이터 수집: yfinance
+- 주문/잔고/랭킹: KIS Open API
+
+---
+
+## 프로젝트 구조
+
+```text
 TradingAgents/
-├── bot.py                      # Discord 봇 (메인 엔트리포인트)
-├── kis_client.py               # 한국투자증권 API 클라이언트 (매매 + 시총 순위)
-├── trade_history.py            # 매매 이력 DB (SQLite) — 수익 추적
-├── main.py                     # Python 직접 실행용 예시
-├── .env                        # 환경변수 (비공개)
-├── .env.example                # 환경변수 템플릿
-├── requirements.txt            # Python 패키지 의존성
-│
-├── data/                       # SQLite DB 저장 (자동 생성)
-│   └── trade_history.db        # 매매 이력 + 실현손익 기록
-│
-├── tradingagents/              # 핵심 프레임워크
-│   ├── default_config.py       # 기본 설정값
-│   ├── graph/                  # LangGraph 기반 에이전트 그래프
-│   │   ├── trading_graph.py    # 메인 그래프 (TradingAgentsGraph)
-│   │   ├── propagation.py      # 상태 초기화 & 전파
-│   │   ├── signal_processing.py # BUY/SELL/HOLD 신호 추출
-│   │   ├── reflection.py       # 학습 & 메모리 반영
-│   │   └── setup.py            # 그래프 노드 연결
-│   ├── agents/                 # 에이전트 정의
-│   │   ├── analysts/           # 애널리스트 4명
-│   │   ├── researchers/        # 강세/약세 리서처
-│   │   ├── managers/           # 리서치/리스크 매니저
-│   │   ├── trader/             # 트레이더
-│   │   └── risk_mgmt/          # 리스크 관리팀
-│   ├── dataflows/              # 데이터 수집 (yfinance, Alpha Vantage)
-│   └── llm_clients/            # LLM 제공자별 클라이언트
-│
-├── cli/                        # 터미널 CLI 인터페이스
-├── reports/                    # 생성된 분석 보고서
-├── results/                    # 종목별 분석 결과
-└── eval_results/               # 평가 로그
+├── bot.py
+├── kis_client.py
+├── trade_history.py
+├── main.py
+├── README.md
+├── .env.example
+├── requirements.txt
+├── pyproject.toml
+├── reports/
+├── data/
+├── cli/
+└── tradingagents/
+    ├── agents/
+    ├── dataflows/
+    ├── graph/
+    ├── llm_clients/
+    └── default_config.py
 ```
+
+주요 파일:
+
+- [`bot.py`](/home/devuser/projects/TradingAgents2/bot.py): Discord 봇, 명령어, 자동매매 스케줄
+- [`kis_client.py`](/home/devuser/projects/TradingAgents2/kis_client.py): KIS REST API 래퍼
+- [`trade_history.py`](/home/devuser/projects/TradingAgents2/trade_history.py): SQLite 기반 매매/손익 기록
+- [`tradingagents/graph/trading_graph.py`](/home/devuser/projects/TradingAgents2/tradingagents/graph/trading_graph.py): 멀티 에이전트 분석 그래프
 
 ---
 
-## 안전장치
+## 운영 메모
 
-| 항목 | 설명 |
-|------|------|
-| **데이 트레이딩 자동매수** | 매일 09:30 KST, 스코어링 → 상위 5개 AI분석 → BUY 종목 통장 전액 균등 매수 |
-| **데이 트레이딩 자동매도** | KR 15:20 / US 15:50, 워치리스트 외 보유분만 시장가 매도 (1회 재시도) |
-| **손절/익절 자동매도** | 30분 간격 감시, 임계값 도달 시 즉시 자동 매도 |
-| **수동 매수 확인 버튼** | `/분석`, `/대형주`, `/매수`는 버튼 확인 후에만 매수 실행 (장외/휴장 시 BUY 버튼 비활성화) |
-| **수동 예산 상한** | 수동 매수는 `KIS_MAX_ORDER_AMOUNT`/`US_MAX_ORDER_AMOUNT` 상한 내에서 주문 |
-| **매매 이력 기록** | 모든 매수/매도를 SQLite DB에 자동 저장 (`/수익`으로 조회) |
-| **재시작 중복 방지** | `daily_state` 테이블로 아침매수/오후매도/손절·익절 실행 여부를 일자별 기록해 중복 주문 방지 |
-| **모의투자 모드** | `KIS_VIRTUAL=true`로 가상계좌에서 안전하게 테스트 |
-| **채널 제한** | `DISCORD_CHANNEL_IDS`로 특정 채널에서만 봇 동작 |
-| **동시 실행 방지** | 한 번에 하나의 분석만 실행 (asyncio Lock) |
-| **버튼 타임아웃** | 매수 버튼 5분, 매도 버튼 2분 후 자동 만료 |
+- 수동 주문은 예산 상한을 넘기면 차단됩니다.
+- 자동매매는 `daily_state` 기록으로 중복 실행을 막습니다.
+- 보고서는 저장 실패 시에도 Discord 전송을 가능한 형태로 fallback 합니다.
+- 분석은 `asyncio.Lock`으로 직렬화되어 동시에 여러 건이 돌지 않습니다.
+- 모의투자에서는 실전과 일부 API 응답 차이가 있을 수 있습니다.
 
-> ⚠️ **면책 조항**: 이 시스템은 연구 및 교육 목적으로 설계되었습니다. 실제 투자 결과는 LLM 모델, 시장 상황, 데이터 품질 등에 따라 달라질 수 있습니다. [투자 조언이 아닙니다.](https://tauric.ai/disclaimer/)
+> 이 프로젝트는 연구/자동화 실험용입니다. 실제 주문 전에는 반드시 모의투자로 충분히 검증하세요.
 
 ---
 
 ## Citation
 
-```
+```bibtex
 @misc{xiao2025tradingagentsmultiagentsllmfinancial,
-      title={TradingAgents: Multi-Agents LLM Financial Trading Framework}, 
+      title={TradingAgents: Multi-Agents LLM Financial Trading Framework},
       author={Yijia Xiao and Edward Sun and Di Luo and Wei Wang},
       year={2025},
       eprint={2412.20138},
       archivePrefix={arXiv},
       primaryClass={q-fin.TR},
-      url={https://arxiv.org/abs/2412.20138}, 
+      url={https://arxiv.org/abs/2412.20138},
 }
 ```

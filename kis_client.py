@@ -444,8 +444,8 @@ class KISClient:
                 "summary": {"total_eval": 0.0, "total_pnl": 0.0, "cash": 0.0, "currency": "USD"},
             }
 
-        tr_id = os.getenv("KIS_US_BALANCE_TR_ID", "VTTS3012R" if self.virtual else "TTTS3012R")
-        path = os.getenv("KIS_US_BALANCE_PATH", "/uapi/overseas-stock/v1/trading/inquire-balance")
+        tr_id = "VTTS3012R" if self.virtual else "TTTS3012R"
+        path = "/uapi/overseas-stock/v1/trading/inquire-balance"
 
         holdings_map: dict[tuple[str, str], dict] = {}
         total_eval = 0.0
@@ -580,8 +580,8 @@ class KISClient:
         return 0.0
 
     def _get_us_price_by_exchange(self, ticker: str, exchange: str) -> float:
-        path = os.getenv("KIS_US_PRICE_PATH", "/uapi/overseas-price/v1/quotations/price")
-        tr_id = os.getenv("KIS_US_PRICE_TR_ID", "HHDFS00000300")
+        path = "/uapi/overseas-price/v1/quotations/price"
+        tr_id = "HHDFS00000300"
 
         try:
             data = self._request(
@@ -740,11 +740,11 @@ class KISClient:
                 "exchange": "",
             }
 
-        path = os.getenv("KIS_US_ORDER_PATH", "/uapi/overseas-stock/v1/trading/order")
+        path = "/uapi/overseas-stock/v1/trading/order"
         if side == "BUY":
-            tr_id = os.getenv("KIS_US_BUY_TR_ID", "VTTT1002U" if self.virtual else "TTTT1002U")
+            tr_id = "VTTT1002U" if self.virtual else "TTTT1002U"
         else:
-            tr_id = os.getenv("KIS_US_SELL_TR_ID", "VTTT1006U" if self.virtual else "TTTT1006U")
+            tr_id = "VTTT1006U" if self.virtual else "TTTT1006U"
         qty_int = int(qty)
         sll_type = "00" if side == "SELL" else ""
 
@@ -1026,9 +1026,9 @@ class KISClient:
         if not self.enable_us_trading or self.virtual:
             return []
 
-        path = os.getenv("KIS_US_MARKET_CAP_PATH", "/uapi/overseas-stock/v1/ranking/market-cap")
-        tr_id = os.getenv("KIS_US_MARKET_CAP_TR_ID", "HHDFS76350100")
-        vol_rang = os.getenv("KIS_US_MARKET_CAP_VOL_RANG", "0")
+        path = "/uapi/overseas-stock/v1/ranking/market-cap"
+        tr_id = "HHDFS76350100"
+        vol_rang = "0"
 
         results: list[dict] = []
         for exchange in self.us_exchange_search_order:
@@ -1104,61 +1104,95 @@ class KISClient:
         return ranked[:count]
 
     def get_us_volume_rank(self, count: int = 30) -> list[dict]:
-        """미국 거래량 상위 후보 조회 (KIS 해외 랭킹 API 우선).
+        """미국 거래량 상위 후보 조회.
 
-        환경변수로 엔드포인트/TR ID를 지정하지 않으면 빈 리스트를 반환하며,
-        상위 레이어(bot)에서 yfinance fallback을 수행하도록 설계.
+        한국투자 공식 문서 기준 이 API는 모의투자를 지원하지 않으므로
+        실전 환경에서만 조회하고, 그 외에는 빈 리스트를 반환한다.
         """
-        if not self.enable_us_trading:
+        if not self.enable_us_trading or self.virtual:
             return []
 
-        path = os.getenv("KIS_US_VOLUME_RANK_PATH", "")
-        tr_id = os.getenv("KIS_US_VOLUME_RANK_TR_ID", "")
-        if not path or not tr_id:
-            return []
+        path = "/uapi/overseas-stock/v1/ranking/trade-vol"
+        tr_id = "HHDFS76310010"
+        nday = "0"
+        prc1 = ""
+        prc2 = ""
+        vol_rang = "0"
 
         results: list[dict] = []
         for exchange in self.us_exchange_search_order:
+            ranking_exchange = self._ranking_exchange_code(exchange)
             try:
                 data = self._request(
                     "GET",
                     path,
                     tr_id,
-                    params={"EXCD": exchange, "NREC": str(count)},
+                    params={
+                        "KEYB": "",
+                        "AUTH": "",
+                        "EXCD": ranking_exchange,
+                        "NDAY": nday,
+                        "PRC1": prc1,
+                        "PRC2": prc2,
+                        "VOL_RANG": vol_rang,
+                    },
                 )
             except Exception as e:
-                logger.warning("US 거래량 랭킹 조회 실패 exchange=%s: %s", exchange, str(e)[:120])
+                logger.warning(
+                    "US 거래량 랭킹 조회 실패 exchange=%s: %s",
+                    ranking_exchange,
+                    str(e)[:120],
+                )
                 continue
 
-            items = data.get("output", [])
-            for idx, item in enumerate(items[:count], start=1):
-                ticker = (item.get("symb") or item.get("ticker") or item.get("pdno") or "").strip().upper()
+            items = data.get("output2", [])
+            if isinstance(items, dict):
+                items = [items]
+
+            for item in items:
+                ticker = (item.get("symb") or item.get("rsym") or "").strip().upper()
                 if not ticker:
                     continue
-                price = _to_float(item.get("last") or item.get("price") or 0)
-                pct = _to_float(item.get("rate") or item.get("prdy_ctrt") or 0)
-                vol = _to_int(item.get("vol") or item.get("acml_vol") or 0)
-                name = (item.get("name") or item.get("prdt_name") or ticker).strip()
                 results.append(
                     {
                         "market": "US",
                         "currency": "USD",
-                        "exchange": exchange,
+                        "exchange": item.get("excd", ranking_exchange),
                         "ticker": ticker,
-                        "name": name,
-                        "rank": idx,
-                        "price": price,
-                        "prdy_ctrt": pct,
-                        "acml_vol": vol,
+                        "name": (item.get("name") or item.get("ename") or ticker).strip(),
+                        "rank": _to_int(item.get("rank", 0)),
+                        "price": _to_float(item.get("last", 0)),
+                        "prdy_ctrt": _to_float(item.get("rate", 0)),
+                        "acml_vol": _to_int(item.get("tvol", 0)),
+                        "trade_amount": _to_float(item.get("tamt", 0)),
+                        "avg_volume": _to_int(item.get("a_tvol", 0)),
                     }
                 )
 
         if not results:
             return []
 
-        # 거래량 기준 정렬
-        results.sort(key=lambda x: x.get("acml_vol", 0), reverse=True)
-        return results[:count]
+        deduped: dict[str, dict] = {}
+        for item in results:
+            existing = deduped.get(item["ticker"])
+            if existing is None or (
+                item.get("rank", 0) > 0
+                and (
+                    existing.get("rank", 0) <= 0
+                    or item["rank"] < existing["rank"]
+                )
+            ):
+                deduped[item["ticker"]] = item
+
+        ranked = list(deduped.values())
+        ranked.sort(
+            key=lambda x: (
+                x.get("rank", 0) <= 0,
+                x.get("rank", 0) if x.get("rank", 0) > 0 else 10**9,
+                -x.get("acml_vol", 0),
+            )
+        )
+        return ranked[:count]
 
     # ── 보유종목 전량 매도 ────────────────────────────────────
 
