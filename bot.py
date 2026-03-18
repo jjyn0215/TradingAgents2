@@ -31,6 +31,8 @@ from trade_history import (
     get_ticker_summary,
     reset_pnl_history,
     is_action_done, mark_action_done, get_daily_state,
+    ensure_budget_anchor,
+    get_budget_anchor,
 )
 
 load_dotenv()
@@ -51,6 +53,27 @@ ALLOWED_CHANNEL_IDS: set[int] = {
 }
 
 
+def _parse_budget_ratio(env_name: str, default: str = "1.0") -> float:
+    """0~1 또는 0~100(%) 형식의 비율 값을 정규화한다."""
+    raw = os.getenv(env_name, default).strip()
+    if raw.endswith("%"):
+        raw = raw[:-1].strip()
+
+    try:
+        ratio = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"{env_name} 값이 올바르지 않습니다. 예: 0.5 또는 50%"
+        ) from exc
+
+    if ratio > 1.0:
+        ratio /= 100.0
+
+    if not (0.0 < ratio <= 1.0):
+        raise RuntimeError(f"{env_name} 값은 0보다 크고 1 이하(또는 100% 이하)여야 합니다.")
+    return ratio
+
+
 def _is_allowed_channel(channel_id: int | None) -> bool:
     """채널 제한이 설정되어 있으면 허용된 채널인지 확인."""
     if channel_id is None:
@@ -68,6 +91,7 @@ MONITOR_INTERVAL_MIN = int(os.getenv("MONITOR_INTERVAL_MIN", "30"))
 DAY_TRADE_PICKS = int(os.getenv("DAY_TRADE_PICKS", "5"))  # 매일 매수할 종목 수
 AUTO_BUY_TIME = os.getenv("AUTO_BUY_TIME", "09:30")         # 자동 매수 시각 (HH:MM)
 AUTO_SELL_TIME = os.getenv("AUTO_SELL_TIME", "15:20")        # 자동 매도 시각 (HH:MM)
+AUTO_BUY_BUDGET_RATIO = _parse_budget_ratio("AUTO_BUY_BUDGET_RATIO", "1.0")
 _buy_h, _buy_m = (int(x) for x in AUTO_BUY_TIME.split(":"))
 _sell_h, _sell_m = (int(x) for x in AUTO_SELL_TIME.split(":"))
 
@@ -76,6 +100,10 @@ ENABLE_US_TRADING = os.getenv("ENABLE_US_TRADING", "false").lower() == "true"
 US_DAY_TRADE_PICKS = int(os.getenv("US_DAY_TRADE_PICKS", "5"))
 US_AUTO_BUY_TIME = os.getenv("US_AUTO_BUY_TIME", "09:35")
 US_AUTO_SELL_TIME = os.getenv("US_AUTO_SELL_TIME", "15:50")
+US_AUTO_BUY_BUDGET_RATIO = _parse_budget_ratio(
+    "US_AUTO_BUY_BUDGET_RATIO",
+    os.getenv("AUTO_BUY_BUDGET_RATIO", "1.0"),
+)
 _us_buy_h, _us_buy_m = (int(x) for x in US_AUTO_BUY_TIME.split(":"))
 _us_sell_h, _us_sell_m = (int(x) for x in US_AUTO_SELL_TIME.split(":"))
 
@@ -408,6 +436,35 @@ def _resolve_scoring_watchlist(
     reason = f"{watchlist_name} 미설정 + 시총/거래량 조회 실패"
     _log("WARN", f"{prefix}SCORING_NO_CANDIDATES", reason)
     return []
+
+
+def _auto_buy_budget_ratio(market: str = "KR") -> float:
+    return US_AUTO_BUY_BUDGET_RATIO if market.upper() == "US" else AUTO_BUY_BUDGET_RATIO
+
+
+def _compute_auto_buy_budget(market: str, available_cash: float) -> dict[str, float]:
+    """자동매수에 사용할 오늘 예산을 계산한다.
+
+    - 기준 자금(anchor): 시장별로 저장되는 최대 확인 예수금
+    - 일일 예산: anchor × 설정 비율
+    - 실제 사용 가능 예산: min(현재 예수금, 일일 예산)
+    """
+    market = market.upper()
+    cash = max(float(available_cash), 0.0)
+    ratio = _auto_buy_budget_ratio(market)
+    anchor = ensure_budget_anchor(market, cash) if cash > 0 else get_budget_anchor(market)
+    anchor = max(float(anchor), cash)
+    target_budget = anchor * ratio if anchor > 0 else cash * ratio
+    usable_budget = min(cash, target_budget) if cash > 0 else 0.0
+
+    return {
+        "market": market,
+        "available_cash": cash,
+        "anchor": anchor,
+        "ratio": ratio,
+        "target_budget": target_budget,
+        "usable_budget": usable_budget,
+    }
 
 
 # ─── Helper: 보고서 생성 ──────────────────────────────────────
@@ -1787,6 +1844,10 @@ async def bot_info_cmd(interaction: discord.Interaction):
             "── **설정** ──",
             f"📊 **KR 매수 종목 수:** {DAY_TRADE_PICKS}개",
             f"📊 **US 매수 종목 수:** {US_DAY_TRADE_PICKS}개",
+            f"💸 **KR 자동예산 비율:** {AUTO_BUY_BUDGET_RATIO * 100:.1f}%",
+            f"💸 **US 자동예산 비율:** {US_AUTO_BUY_BUDGET_RATIO * 100:.1f}%",
+            f"🏦 **KR 기준 자금(anchor):** {_format_money(get_budget_anchor('KR'), 'KRW')}",
+            f"🏦 **US 기준 자금(anchor):** {_format_money(get_budget_anchor('US'), 'USD')}",
             f"🧪 **KR 수동 예산:** {_format_money(kis.max_order_amount, 'KRW')}",
             f"🧪 **US 수동 예산:** {_format_money(kis.us_max_order_amount, 'USD')}",
             f"🔴 **손절 라인:** {STOP_LOSS_PCT}%",
@@ -2349,7 +2410,21 @@ async def morning_auto_buy():
             await channel.send("❌ 예수금이 0원입니다. 매수할 수 없습니다.")
             return
 
-        per_stock_budget = int(cash // len(buy_targets))
+        budget_info = _compute_auto_buy_budget("KR", cash)
+        daily_budget = int(budget_info["usable_budget"])
+        if daily_budget <= 0:
+            _log("WARN", "AUTO_BUY_NO_BUDGET", f"cash={cash} ratio={budget_info['ratio']}")
+            await channel.send("❌ 오늘 사용할 자동매수 예산이 0원이라 매수를 건너뜁니다.")
+            return
+
+        per_stock_budget = int(daily_budget // len(buy_targets))
+        await channel.send(
+            "💸 **KR 자동매수 예산**\n"
+            f"가용 예수금: {format_krw(cash)}\n"
+            f"기준 자금(anchor): {format_krw(budget_info['anchor'])}\n"
+            f"적용 비율: {budget_info['ratio'] * 100:.1f}%\n"
+            f"오늘 사용 예산: {format_krw(daily_budget)}"
+        )
         buy_results: list[str] = []
         total_invested = 0
 
@@ -2377,8 +2452,11 @@ async def morning_auto_buy():
             except Exception:
                 remaining_cash = cash
 
-            if qty * current_price > remaining_cash:
-                qty = int(remaining_cash // current_price)
+            remaining_budget = max(daily_budget - total_invested, 0)
+            effective_cash = min(remaining_cash, remaining_budget)
+
+            if qty * current_price > effective_cash:
+                qty = int(effective_cash // current_price)
                 if qty <= 0:
                     buy_results.append(f"⚠️ {target['name']} — 잔액 부족")
                     continue
@@ -2420,7 +2498,10 @@ async def morning_auto_buy():
             name="투자금액", value=format_krw(total_invested), inline=True
         )
         result_embed.add_field(
-            name="예수금 잔액", value=format_krw(cash - total_invested), inline=True
+            name="예산 잔여", value=format_krw(max(daily_budget - total_invested, 0)), inline=True
+        )
+        result_embed.add_field(
+            name="예수금 잔액", value=format_krw(max(cash - total_invested, 0)), inline=True
         )
         result_embed.set_footer(text=f"데이 트레이딩 | {mode_label}")
         await channel.send(embed=result_embed)
@@ -2818,7 +2899,21 @@ async def us_morning_auto_buy():
             await channel.send("❌ USD 예수금이 0입니다. 매수를 건너뜁니다.")
             return
 
-        per_stock_budget = float(cash) / len(buy_targets)
+        budget_info = _compute_auto_buy_budget("US", cash)
+        daily_budget = float(budget_info["usable_budget"])
+        if daily_budget <= 0:
+            _log("WARN", "US_AUTO_BUY_NO_BUDGET", f"cash={cash} ratio={budget_info['ratio']}")
+            await channel.send("❌ 오늘 사용할 미국 자동매수 예산이 0이라 매수를 건너뜁니다.")
+            return
+
+        per_stock_budget = float(daily_budget) / len(buy_targets)
+        await channel.send(
+            "💸 **US 자동매수 예산**\n"
+            f"가용 예수금: {_format_money(cash, 'USD')}\n"
+            f"기준 자금(anchor): {_format_money(budget_info['anchor'], 'USD')}\n"
+            f"적용 비율: {budget_info['ratio'] * 100:.1f}%\n"
+            f"오늘 사용 예산: {_format_money(daily_budget, 'USD')}"
+        )
         buy_results: list[str] = []
         total_invested = 0.0
 
@@ -2844,8 +2939,11 @@ async def us_morning_auto_buy():
             except Exception:
                 remaining_cash = cash
 
-            if qty * current_price > remaining_cash:
-                qty = int(remaining_cash // current_price)
+            remaining_budget = max(daily_budget - total_invested, 0.0)
+            effective_cash = min(remaining_cash, remaining_budget)
+
+            if qty * current_price > effective_cash:
+                qty = int(effective_cash // current_price)
                 if qty <= 0:
                     buy_results.append(f"⚠️ {target['name']} — 잔액 부족")
                     continue
@@ -2882,6 +2980,11 @@ async def us_morning_auto_buy():
             timestamp=datetime.datetime.now(NY_TZ),
         )
         result_embed.add_field(name="투자금액", value=_format_money(total_invested, "USD"), inline=True)
+        result_embed.add_field(
+            name="예산 잔여",
+            value=_format_money(max(daily_budget - total_invested, 0), "USD"),
+            inline=True,
+        )
         result_embed.add_field(
             name="예수금 잔액",
             value=_format_money(max(cash - total_invested, 0), "USD"),
@@ -3249,10 +3352,10 @@ async def on_ready():
     print(f"   KIS: {'✅ 설정됨' if kis.is_configured else '❌ 미설정'}")
     print(f"   모드: {'🧪 모의투자' if kis.virtual else '💰 실전투자'}")
     print(f"   KR 자동매매: 매수 {AUTO_BUY_TIME} / 매도 {AUTO_SELL_TIME} KST")
-    print(f"   KR 매수 종목 수: {DAY_TRADE_PICKS}개 | 예산: 통장 전액")
+    print(f"   KR 매수 종목 수: {DAY_TRADE_PICKS}개 | 예산 비율: {AUTO_BUY_BUDGET_RATIO * 100:.1f}%")
     if ENABLE_US_TRADING:
         print(f"   US 자동매매: 매수 {US_AUTO_BUY_TIME} / 매도 {US_AUTO_SELL_TIME} ET")
-        print(f"   US 매수 종목 수: {US_DAY_TRADE_PICKS}개 | 예산: USD 예수금")
+        print(f"   US 매수 종목 수: {US_DAY_TRADE_PICKS}개 | 예산 비율: {US_AUTO_BUY_BUDGET_RATIO * 100:.1f}%")
     else:
         print("   US 자동매매: 비활성화 (ENABLE_US_TRADING=false)")
     print(f"   손절: {STOP_LOSS_PCT}% | 익절: {TAKE_PROFIT_PCT}%")

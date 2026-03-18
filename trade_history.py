@@ -87,6 +87,12 @@ def init_db():
             reason      TEXT DEFAULT '',
             created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
         );
+
+        CREATE TABLE IF NOT EXISTS budget_anchor (
+            market       TEXT PRIMARY KEY,
+            anchor_amount REAL NOT NULL DEFAULT 0,
+            updated_at   TEXT NOT NULL
+        );
     """
     )
 
@@ -390,6 +396,50 @@ def get_daily_state(date: str | None = None) -> list[dict]:
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def get_budget_anchor(market: str = "KR") -> float:
+    """시장별 자동매수 기준 자금(anchor) 조회."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT anchor_amount FROM budget_anchor WHERE market = ?",
+        ((market or "KR").upper(),),
+    ).fetchone()
+    conn.close()
+    return float(row["anchor_amount"]) if row else 0.0
+
+
+def set_budget_anchor(market: str, anchor_amount: float) -> float:
+    """시장별 자동매수 기준 자금을 저장한다."""
+    market = (market or "KR").upper()
+    amount = max(float(anchor_amount), 0.0)
+    now = datetime.datetime.now().isoformat()
+
+    conn = _get_conn()
+    conn.execute(
+        """
+        INSERT INTO budget_anchor (market, anchor_amount, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(market) DO UPDATE SET
+            anchor_amount = excluded.anchor_amount,
+            updated_at = excluded.updated_at
+        """,
+        (market, amount, now),
+    )
+    conn.commit()
+    conn.close()
+    return amount
+
+
+def ensure_budget_anchor(market: str, available_cash: float) -> float:
+    """기준 자금이 없으면 현재 예수금으로 초기화하고, 더 큰 값이 들어오면 상향 반영한다."""
+    market = (market or "KR").upper()
+    cash = max(float(available_cash), 0.0)
+    current = get_budget_anchor(market)
+
+    if cash > 0 and (current <= 0 or cash > current):
+        return set_budget_anchor(market, cash)
+    return current
 
 
 # 모듈 로드 시 DB 초기화

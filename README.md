@@ -31,6 +31,7 @@
 - Discord 슬래시 명령 11개로 분석, 잔고조회, 수동 주문, 스코어링, 손익 조회를 제공합니다.
 - 한국(KR)과 미국(US) 모두 워치리스트 기반 스코어링 뒤 상위 후보만 AI 분석합니다.
 - 자동매매는 `룰 기반 후보 선정 -> 상위 N개 AI 분석 -> BUY 종목만 균등매수 -> 오후 점검 -> 손절/익절 감시` 흐름으로 동작합니다.
+- 자동매수 예산은 `기준 자금(anchor) × 비율`로 계산할 수 있어, 예를 들어 `50%` 설정 시 절반씩 회전 투자할 수 있습니다.
 - 분석 보고서는 Markdown 파일로 저장되며, 필요하면 Discord에도 자동 업로드합니다.
 - 매매 이력과 실현손익은 SQLite로 누적 관리합니다.
 
@@ -53,8 +54,8 @@
 
 | 시장 | 후보 풀 | 자동 매수 | 오후 점검 | 장중 감시 |
 |------|---------|-----------|-----------|-----------|
-| KR | `KR_WATCHLIST` 우선, 비어 있으면 시총/거래량 랭킹 fallback | `AUTO_BUY_TIME` (기본 `09:30` KST) | `AUTO_SELL_TIME` (기본 `15:20` KST) | `MONITOR_INTERVAL_MIN` 간격 |
-| US | `US_WATCHLIST` 우선, 비어 있으면 시총/거래량 랭킹 fallback | `US_AUTO_BUY_TIME` (기본 `09:35` ET) | `US_AUTO_SELL_TIME` (기본 `15:50` ET) | `MONITOR_INTERVAL_MIN` 간격 |
+| KR | `KR_WATCHLIST` 우선, 비어 있으면 시총/거래량 랭킹 fallback | `AUTO_BUY_TIME` (기본 `09:30` KST), 예산 `AUTO_BUY_BUDGET_RATIO` 적용 | `AUTO_SELL_TIME` (기본 `15:20` KST) | `MONITOR_INTERVAL_MIN` 간격 |
+| US | `US_WATCHLIST` 우선, 비어 있으면 시총/거래량 랭킹 fallback | `US_AUTO_BUY_TIME` (기본 `09:35` ET), 예산 `US_AUTO_BUY_BUDGET_RATIO` 적용 | `US_AUTO_SELL_TIME` (기본 `15:50` ET) | `MONITOR_INTERVAL_MIN` 간격 |
 
 ### 현재 스코어링 규칙
 
@@ -189,9 +190,11 @@ US_WATCHLIST=AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,AMD,AVGO,QQQ,SPY
 
 # Schedule
 DAY_TRADE_PICKS=5
+AUTO_BUY_BUDGET_RATIO=1.0
 AUTO_BUY_TIME=09:30
 AUTO_SELL_TIME=15:20
 US_DAY_TRADE_PICKS=5
+US_AUTO_BUY_BUDGET_RATIO=1.0
 US_AUTO_BUY_TIME=09:35
 US_AUTO_SELL_TIME=15:50
 
@@ -214,6 +217,9 @@ MAX_DEBATE_ROUNDS=1
 - 자동매매 스케줄은 `DISCORD_CHANNEL_IDS`가 설정된 경우에만 실제로 동작합니다.
 - 미국 수동/자동 주문은 `ENABLE_US_TRADING=true`가 아니면 막힙니다.
 - `KIS_VIRTUAL=true`면 모의투자, `false`면 실전투자입니다.
+- `AUTO_BUY_BUDGET_RATIO=0.5`처럼 설정하면 KR 자동매수는 기준 자금의 50%만 사용합니다. `50%` 형식도 가능합니다.
+- `US_AUTO_BUY_BUDGET_RATIO`를 비워두면 미국 자동매수도 같은 비율을 사용합니다.
+- 기준 자금(anchor)은 시장별로 저장되는 자동매수 기준 예수금이며, 더 큰 예수금을 확인하면 자동으로 상향 갱신됩니다.
 - Discord 봇은 모델명만 환경변수로 덮어쓰고, 기본 provider는 [`tradingagents/default_config.py`](/home/devuser/projects/TradingAgents2/tradingagents/default_config.py) 설정을 따릅니다.
 
 ### KIS 앱키 발급
@@ -281,7 +287,7 @@ python bot.py
 1. 워치리스트 점수 계산
 2. 보유 종목 제외
 3. 상위 `DAY_TRADE_PICKS`만 AI 분석
-4. BUY 종목만 통장 전액 균등분할 매수
+4. BUY 종목만 `기준 자금(anchor) × AUTO_BUY_BUDGET_RATIO` 예산 안에서 균등분할 매수
 5. 장 시작 전 분석이 끝나면 개장까지 대기 후 주문
 
 #### KR 오후 점검
@@ -294,7 +300,7 @@ python bot.py
 #### US 자동매매
 
 - `ENABLE_US_TRADING=true`일 때만 실행됩니다.
-- KR과 동일한 흐름으로 동작하되 시간대만 ET 기준입니다.
+- KR과 동일한 흐름으로 동작하되 시간대만 ET 기준이며, 예산은 `US_AUTO_BUY_BUDGET_RATIO`를 따릅니다.
 - 오후 점검도 `US_WATCHLIST` 밖 종목만 정리합니다.
 
 #### 손절/익절 모니터링
