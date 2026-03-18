@@ -38,7 +38,7 @@ from trade_history import (
 load_dotenv()
 
 # ─── Version ───────────────────────────────────────────────────
-BOT_VERSION = "2.1.3"
+BOT_VERSION = "2.2.0"
 
 # ─── Config ────────────────────────────────────────────────────
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
